@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: bash -n bw-agent && bash -n tests/run.sh
+      - name: shellcheck
+        run: shellcheck bw-agent tests/run.sh
+      - name: tests (mock bw serve)
+        run: ./tests/run.sh

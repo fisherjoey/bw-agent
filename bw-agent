@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# bw-agent: a folder-scoped Bitwarden accessor for AI coding agents, built on
+# the local `bw serve` API. It only sees one vault folder (BW_AGENT_FOLDER,
+# default "Claude"). Default verbs never print secret values to stdout; only
+# `get --reveal` does (with a warning).
+#
+# https://github.com/fisherjoey/bw-agent  (MIT licensed)
+set -euo pipefail
+
+API="${BW_AGENT_API:-http://127.0.0.1:8087}"
+FOLDER_NAME="${BW_AGENT_FOLDER:-Claude}"
+
+die() { echo "bw-agent: $*" >&2; exit 1; }
+
+api() { # method path [json-body]
+  local method="$1" path="$2" body="${3:-}"
+  # bw serve throws transient 500s under rapid use. Retry idempotent GETs a few
+  # times (silently); never retry writes, to avoid accidental double create/update.
+  local attempts=1 i out code
+  [[ "$method" == "GET" ]] && attempts=4
+  for ((i = 1; i <= attempts; i++)); do
+    if [[ -n "$body" ]]; then
+      # Body goes in on stdin, never as a -d argv element: argv is world-readable
+      # via ps/proc for the life of the call, and the body carries the secret.
+      out="$(printf '%s' "$body" | curl -sS -w $'\n%{http_code}' -X "$method" "$API$path" -H 'Content-Type: application/json' --data-binary @- 2>/dev/null)" || true
+    else
+      out="$(curl -sS -w $'\n%{http_code}' -X "$method" "$API$path" 2>/dev/null)" || true
+    fi
+    code="${out##*$'\n'}"; out="${out%$'\n'*}"
+    if [[ "$code" == 2* ]]; then printf '%s' "$out"; return 0; fi
+    [[ $i -lt $attempts ]] && sleep 1
+  done
+  die "API ${method} ${path} failed (HTTP ${code:-no-response}) after ${attempts} attempt(s)"
+}
+
+status_str() { api GET /status 2>/dev/null | jq -r '.data.template.status' 2>/dev/null || true; }
+
+require_unlocked() {
+  case "$(status_str)" in
+    unlocked) : ;;
+    locked) die "vault locked — ask the user to run:  bw-agent unlock" ;;
+    unauthenticated) die "not logged in — ask the user to run:  bw login" ;;
+    *) die "cannot reach bw serve at $API (is \`bw serve\` running? e.g. systemctl --user status bw-serve)" ;;
+  esac
+}
+
+folder_id() {
+  api GET /list/object/folders \
+    | jq -r --arg n "$FOLDER_NAME" '.data.data[] | select(.name==$n) | .id' | head -n1
+}
+
+ensure_folder() {
+  local id; id="$(folder_id)"
+  if [[ -z "$id" ]]; then
+    api POST /object/folder "$(jq -nc --arg n "$FOLDER_NAME" '{name:$n}')" >/dev/null
+    id="$(folder_id)"
+  fi
+  [[ -n "$id" ]] || die "could not create/find folder '$FOLDER_NAME'"
+  printf '%s' "$id"
+}
+
+item_id() { # name -> id (only within the scoped folder)
+  local name="$1" cid; cid="$(folder_id)"
+  [[ -n "$cid" ]] || die "folder '$FOLDER_NAME' not found (run: bw-agent ensure-folder)"
+  api GET "/list/object/items?folderid=$cid&search=$(jq -rn --arg s "$name" '$s|@uri')" \
+    | jq -r --arg n "$name" '.data.data[] | select(.name==$n) | .id' | head -n1
+}
+
+get_password() { # name
+  local id; id="$(item_id "$1")"; [[ -n "$id" ]] || die "no item '$1' in folder '$FOLDER_NAME'"
+  api GET "/object/password/$id" | jq -r '.data.data'
+}
+
+get_field() { # name field
+  local id; id="$(item_id "$1")"; [[ -n "$id" ]] || die "no item '$1' in folder '$FOLDER_NAME'"
+  api GET "/object/item/$id" \
+    | jq -r --arg f "$2" '(.data.fields // [])[] | select(.name==$f) | .value' | head -n1
+}
+
+store_item() { # name user notes  (secret on STDIN) — shared by `put` and `request`
+  local name="$1" user="$2" notes="$3" cid secret tmpl existing
+  cid="$(ensure_folder)"
+  secret="$(cat)"; [[ -n "$secret" ]] || die "no secret provided"
+  # -Rs takes the secret from stdin; passing it as --arg would expose it in argv.
+  tmpl="$(printf '%s' "$secret" | jq -Rs --arg n "$name" --arg c "$cid" --arg u "$user" --arg notes "$notes" \
+    '{type:1,name:$n,folderId:$c,notes:(if $notes=="" then null else $notes end),login:{username:(if $u=="" then null else $u end),password:.}}')"
+  existing="$(item_id "$name" || true)"
+  if [[ -n "$existing" ]]; then
+    api PUT "/object/item/$existing" "$tmpl" >/dev/null && echo "updated '$name' in folder '$FOLDER_NAME'"
+  else
+    api POST /object/item "$tmpl" >/dev/null && echo "stored '$name' in folder '$FOLDER_NAME'"
+  fi
+}
+
+# An agent's shell tool often does not inherit the desktop session environment,
+# so a GUI dialog launched from it has no display to attach to. Recover the
+# session vars from a running compositor/shell process owned by this user.
+hydrate_display() {
+  [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]] && return 0
+  local pid kv
+  # shellcheck disable=SC2086 # word-splitting the list is intended
+  for proc in ${BW_AGENT_SESSION_PROCS:-plasmashell kwin_wayland gnome-shell}; do
+    pid="$(pgrep -u "$(id -u)" -x "$proc" 2>/dev/null | head -n1)" || true
+    [[ -n "$pid" ]] && break
+  done
+  [[ -n "$pid" ]] || return 1
+  while IFS= read -r -d '' kv; do
+    case "$kv" in
+      WAYLAND_DISPLAY=*|DISPLAY=*|XDG_RUNTIME_DIR=*|DBUS_SESSION_BUS_ADDRESS=*|XAUTHORITY=*) export "${kv?}" ;;
+    esac
+  done < "/proc/$pid/environ" 2>/dev/null || true
+  [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]
+}
+
+# Prints the pasted secret on stdout. Callers must pipe it, never echo it.
+# The default timeout (90s) stays under the common 120s tool-call limit of agent
+# shells, so the caller sees a clean timeout instead of being killed mid-dialog.
+prompt_secret() { # name reason
+  local name="$1" reason="$2" title="An agent needs a secret" body val rc=0
+  local tmo="${BW_AGENT_MODAL_TIMEOUT:-90}"
+  hydrate_display || { echo "bw-agent: no graphical session — cannot show the paste dialog." >&2
+    echo "  Run this from a desktop session, or store it yourself:  printf '%s' \"\$VAL\" | bw-agent put $name" >&2
+    exit 3; }
+  body="An AI agent is requesting a secret to store in Bitwarden.
+
+Folder: $FOLDER_NAME
+Item:   $name"
+  [[ -n "$reason" ]] && body+="
+Reason: $reason"
+  body+="
+
+Paste the value below. It goes straight into your vault.
+The agent never receives it and it never enters the transcript."
+
+  if command -v kdialog >/dev/null 2>&1; then
+    val="$(timeout "$tmo" kdialog --title "$title" --password "$body" 2>/dev/null)" || rc=$?
+  elif command -v zenity >/dev/null 2>&1; then
+    # --entry --hide-text (not --password) so the item name and reason are shown.
+    val="$(timeout "$tmo" zenity --entry --hide-text --title "$title" --text "$body" 2>/dev/null)" || rc=$?
+  else
+    die "no dialog tool found (install kdialog or zenity)"
+  fi
+
+  case "$rc" in
+    0) ;;
+    124) echo "bw-agent: dialog timed out after ${tmo}s — nothing stored." >&2; exit 5 ;;
+    *)   echo "bw-agent: cancelled — nothing stored." >&2; exit 4 ;;
+  esac
+  [[ -n "$val" ]] || { echo "bw-agent: empty value — nothing stored." >&2; exit 4; }
+  printf '%s' "$val"
+}
+
+usage() {
+  cat >&2 <<EOF
+bw-agent — folder-scoped Bitwarden accessor for agents (folder: ${FOLDER_NAME})
+
+  bw-agent status                         show vault lock state
+  bw-agent unlock                         unlock the vault (prompts for master password)
+  bw-agent lock                           lock the vault
+  bw-agent sync                           pull latest vault changes
+  bw-agent list                           list item NAMES in the scoped folder
+  bw-agent ensure-folder                  create the scoped folder if missing
+  bw-agent get <name> [--field F]         show metadata only (length + last4)
+  bw-agent get <name> [--field F] --reveal   PRINT the value (lands in transcript!)
+  bw-agent exec <name> [--env VAR] -- cmd...  run cmd with secret in env VAR (default SECRET)
+  bw-agent file <name> <path>             write secret to <path> as 0600
+  bw-agent put  <name> [--user U] [--notes N]   store secret read from STDIN
+  bw-agent request <name> [--reason R] [--force]  ask the user via a GUI dialog, store it
+                                          (exit 0 already-stored, 3 no-display, 4 cancelled, 5 timeout)
+EOF
+  exit 64
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  status) api GET /status | jq '.data.template' ;;
+  unlock)
+    read -rsp 'Bitwarden master password: ' _pw; echo
+    # -Rs reads the password from stdin so it never appears in jq's argv.
+    resp="$(api POST /unlock "$(printf '%s' "$_pw" | jq -Rs '{password:.}')")" || { unset _pw; die "unlock request failed"; }
+    unset _pw
+    if [[ "$(jq -r '.success' <<<"$resp")" == "true" ]]; then echo "vault unlocked"; else die "unlock failed: $(jq -r '.message // "unknown"' <<<"$resp")"; fi
+    ;;
+  lock) api POST /lock >/dev/null && echo "vault locked" ;;
+  sync) require_unlocked; api POST /sync >/dev/null && echo "synced" ;;
+  ensure-folder) require_unlocked; ensure_folder >/dev/null && echo "folder '$FOLDER_NAME' ready" ;;
+  list) require_unlocked; cid="$(folder_id)"; if [[ -n "$cid" ]]; then api GET "/list/object/items?folderid=$cid" | jq -r '.data.data[].name'; else echo "(folder empty or missing)"; fi ;;
+  get)
+    require_unlocked
+    name=""; field=""; reveal=0
+    while [[ $# -gt 0 ]]; do case "$1" in
+      --field) field="${2:?--field needs a value}"; shift 2;;
+      --reveal) reveal=1; shift;;
+      -*) die "unknown flag: $1";;
+      *) name="$1"; shift;;
+    esac; done
+    [[ -n "$name" ]] || die "usage: bw-agent get <name> [--field F] [--reveal]"
+    if [[ -n "$field" ]]; then val="$(get_field "$name" "$field")"; else val="$(get_password "$name")"; fi
+    [[ -n "$val" ]] || die "item '$name' has no ${field:-password} value"
+    if [[ "$reveal" == 1 ]]; then
+      echo "bw-agent: WARNING — revealing secret to stdout; it WILL be saved in the conversation transcript" >&2
+      printf '%s\n' "$val"
+    else
+      printf "item '%s' present; length %d; ends '…%s'. Use exec/file, or add --reveal to print.\n" "$name" "${#val}" "${val: -4}"
+    fi
+    ;;
+  exec)
+    require_unlocked
+    envname="SECRET"; name=""
+    while [[ $# -gt 0 ]]; do case "$1" in
+      --env) envname="${2:?--env needs a value}"; shift 2;;
+      --) shift; break;;
+      -*) die "unknown flag: $1";;
+      *) name="$1"; shift;;
+    esac; done
+    [[ -n "$name" ]] || die "usage: bw-agent exec <name> [--env VAR] -- <command...>"
+    [[ $# -gt 0 ]] || die "no command given after --"
+    val="$(get_password "$name")"
+    export "$envname=$val"
+    exec "$@"
+    ;;
+  file)
+    require_unlocked
+    name="${1:?usage: bw-agent file <name> <path>}"; path="${2:?usage: bw-agent file <name> <path>}"
+    umask 077
+    get_password "$name" > "$path"
+    chmod 600 "$path"
+    echo "wrote secret '$name' to $path (0600)"
+    ;;
+  put)
+    require_unlocked
+    name="${1:?usage: bw-agent put <name> [--user U] [--notes N]  (value on stdin)}"; shift
+    user=""; notes=""
+    while [[ $# -gt 0 ]]; do case "$1" in
+      --user) user="${2:-}"; shift 2;;
+      --notes) notes="${2:-}"; shift 2;;
+      -*) die "unknown flag: $1";;
+      *) shift;;
+    esac; done
+    store_item "$name" "$user" "$notes"
+    ;;
+  request)
+    require_unlocked
+    name="${1:?usage: bw-agent request <name> [--reason R] [--user U] [--notes N] [--force]}"; shift
+    reason=""; user=""; notes=""; force=0
+    while [[ $# -gt 0 ]]; do case "$1" in
+      --reason) reason="${2:-}"; shift 2;;
+      --user) user="${2:-}"; shift 2;;
+      --notes) notes="${2:-}"; shift 2;;
+      --force) force=1; shift;;
+      -*) die "unknown flag: $1";;
+      *) shift;;
+    esac; done
+    # Already in the vault: no dialog, no nagging, no accidental overwrite.
+    if [[ "$force" == 0 && -n "$(item_id "$name" || true)" ]]; then
+      echo "already stored: '$name' — use exec/file to consume it, or --force to replace"
+      exit 0
+    fi
+    # Command substitution, not a pipe: in `prompt_secret | store_item` the
+    # dialog runs in a subshell, so its 3/4/5 exit codes are swallowed and a
+    # cancel surfaces as a generic failure from store_item's empty stdin.
+    secret_val="$(prompt_secret "$name" "$reason")"
+    printf '%s' "$secret_val" | store_item "$name" "$user" "$notes"
+    unset secret_val
+    ;;
+  *) usage ;;
+esac
